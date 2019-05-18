@@ -7,6 +7,7 @@ from tensorflow.contrib.rnn.python.ops import core_rnn_cell
 import numpy as np
 from utils import create_vocabulary
 from utils import load_vocabulary
+from utils import DataProcessor
 
 #allow_abbrev 参数是否需要简写
 parser = argparse.ArgumentParser(allow_abbrev=False)
@@ -246,5 +247,177 @@ for p in params:
 gradients_slot = tf.gradients(slot_loss, slot_params)
 gradients_intent = tf.gradients(intent_loss, intent_params)
 
+#需要看看这两个函数
 clipped_gradients_slot, norm_slot = tf.clip_by_global_norm(gradients_slot, 5.0)
 clipped_gradients_intent, norm_intent = tf.clip_by_global_norm(gradients_intent, 5.0)
+
+gradient_norm_slot = norm_slot
+gradient_norm_intent = norm_intent
+update_slot = opt.apply_gradients(zip(clipped_gradients_slot, slot_params))
+update_intent = opt.apply_gradients(zip(clipped_gradients_intent, intent_params), global_step=global_step)
+
+training_outputs = [global_step, slot_loss, update_intent, update_slot, gradient_norm_intent, gradient_norm_slot]
+inputs = [input_data, sequence_length, slots, slot_weights, intent]
+
+#Create Inference Model
+with tf.variable_scope("model", reuse=True):
+    inference_outputs = create_model(input_data, len(in_vocab["vocab"]), sequence_length, \
+            len(slot_vocab["vocab"]), len(intent_vocab["vocab"]), layer_size=arg.layer_size, is_training=False)
+inference_slot_output = tf.nn.softmax(inference_outputs[0], name="slot_output")
+inference_intent_output = tf.nn.softmax(inference_outputs[1], name="intent_output")
+
+inference_outputs = [inference_intent_output, inference_slot_output]
+inference_inputs = [input_data, sequence_length]
+
+logging.basicConfig(format="%(asctime)s : %(levelname)s : %(message)s", level=logging.INFO)
+
+saver = tf.train.Saver()
+
+#Start Training
+with tf.Session() as sess:
+    sess.run(tf.global_variables_initializer())
+    logging.info("Training Start")
+
+    epoch = 0
+    loss = 0.0
+    data_processor = None
+    line = 0
+    num_loss = 0
+    step = 0
+    no_improve = 0
+
+    #variables to store highest values among epochs, only use 'valid_err' for now
+    valid_slot = 0
+    test_slot = 0
+    valid_intent = 0
+    test_intent = 0
+    valid_err = 0
+    test_err = 0
+
+    while True:
+        if data_processor == None:
+            data_processor = DataProcessor(os.path.join(full_train_path, arg.input_file), \
+                    os.path.join(full_train_path, arg.slot_file), os.path.join(full_train_path, arg.intent_file),\
+                    in_vocab, slot_vocab, intent_vocab)
+        in_data, slot_data, slot_weight, length, intents, _, _, _ = data_processor.get_batch(arg.batch_size)
+        feed_dict = {input_data.name : in_data,
+                slots.name : slot_data,
+                slot_weights.name : slot_weight,
+                sequence_length.name : length,
+                intent.name : intents
+            }
+        ret = sess.run(training_outputs, feed_dict)
+        loss += np.mean(ret[1])
+
+        line += arg.batch_size
+        step = ret[0]
+        num_loss += 1
+
+        if data_processor.end == 1:
+            line = 0
+            data_processor.close()
+            data_processor = None
+            epochs += 1
+            logging.info("Step: " + str(step))
+            logging.info("Epoch: " + str(epochs))
+            logging.info("Loss: " + str(loss / num_loss))
+            num_loss = 0
+            loss = 0.0
+
+            save_path = os.path.join(arg.model_path, "_step_" + str(step) + "_epochs_" + str(epochs) + ".ckpt")
+            saver.save(sess, save_path)
+
+            def valid(in_path, slot_path, intent_path):
+                data_processor_valid = DataProcessor(in_path, slot_path, intent_path, in_vocab, slot_vocab, intent_vocab)
+                pred_intents = []
+                correct_intents = []
+                slot_outputs = []
+                correct_slots = []
+                input_words = []
+
+                #
+                gate_seq = []
+                while True:
+                    in_data, slot_data, slot_weight, length, intents, in_seq, slot_seq, intent_seq = \
+                            data_processor_valid.get_batch(arg.batch_size)
+                    feed_dict = {input_data.name : in_data,
+                            sequence_length.name : length}
+                    ret = sess.run(inference_outputs, feed_dict)
+                    for i in ret[0]:
+                        pred_intents.append(np.argmax(i))
+                    for i in intents:
+                        correct_intents.append(i)
+
+                    # [batch, time, class]
+                    pred_slots = ret[1].reshape((slot_data.shape[0], slot_data.shape[1], -1))
+
+                    for p, t, i, l in zip(pred_slots, slot_data, in_data, length):
+                        p = np.argmax(p, 1)
+                        tmp_pred = []
+                        tmp_correct = []
+                        tmp_input = []
+                        for j in range(l):
+                            tmp_pred.append(slot_vocab["rev"][p[j]])
+                            tmp_correct.append(slot_vocab["rev"][t[j]])
+                            tmp_input.append(in_vocab["rev"][i[j]])
+                        slot_outputs.append(tmp_pred)
+                        correct_slots.append(tmp_correct)
+                        input_words.append(tmp_input)
+
+                    if data_processor_valid.end == 1:
+                        break
+
+                pred_intents = np.array(pred_intents)
+                correct_intents = np.array(correct_intents)
+                accuracy = (pred_intents == correct_intents)
+                semantic_error = accuracy
+                accuracy = accuracy.astype(float)
+                accuracy = np.mean(accuracy) * 100.0
+
+                index = 0
+                for t, p in zip(correct_slots, slot_outputs):
+                    if len(t) != len(p):
+                        raise ValueError("Error!")
+
+                    for j in range(len(t)):
+                        if p[j] != t[j]:
+                            semantic_error[index] = False
+                            break
+                    index += 1
+                semantic_error = semantic_error.astype(float)
+                semantic_error = np.mean(semantic_error) * 100.0
+                
+                f1, precision, recall = compute_f1_score(correct_slots, slot_outputs)
+                logging.info("slot f1: " + str(f1))
+                logging.info("intent accuracy: " + str(accuracy))
+                logging.info("semantic error(intent, slots are all ircorrect): " + str(semantic_error))
+
+                data_processor_valid.close()
+
+                return f1, accuracy, semantic_error, pred_intents, correct_intents,\
+                        slot_outputs, correct_slots, input_words, gate_seq
+
+            logging.inf("Valid: ")
+            epoch_valid_slot, epoch_valid_intent, epoch_valid_err, valid_pred_intent, valid_correct_intent, \
+                    valid_pred_slot, valid_correct_slot, valid_words, valid_gate = \
+                    valid(os.path.join(full_valid_path, arg.input_file), \
+                          os.path.join(full_valid_path, arg.slot_file), \
+                          os.path.join(full_valid_path, arg.intent_file))
+            logging.info("Test: ")
+            epoch_test_slot, epoch_test_intent, epoch_test_err, test_pred_intent, test_correct_intent, \
+                    test_pred_slot, test_correct_slot, test_words, test_gate = \
+                    valid(os.path.join(full_test_path, arg.input_file),\
+                          os.path.join(full_test_path, arg.slot_file),\
+                          os.path.join(full_test_path, arg.intent_file))
+            if epoch_valid_err <= valid_err:
+                no_improve += 1
+            else:
+                valid_err = epoch_valid_err
+                no_improve = 0
+
+            if epochs == arg.max_epochs:
+                break
+
+            if arg.early_stop == True:
+                if no_improve > arg.patience:
+                    break
