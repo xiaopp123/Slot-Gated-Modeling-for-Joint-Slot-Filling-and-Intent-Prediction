@@ -8,6 +8,7 @@ import numpy as np
 from utils import create_vocabulary
 from utils import load_vocabulary
 from utils import DataProcessor
+from utils import compute_f1_score
 
 #allow_abbrev 参数是否需要简写
 parser = argparse.ArgumentParser(allow_abbrev=False)
@@ -278,7 +279,7 @@ with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
     logging.info("Training Start")
 
-    epoch = 0
+    epochs = 0
     loss = 0.0
     data_processor = None
     line = 0
@@ -387,7 +388,9 @@ with tf.Session() as sess:
                 semantic_error = semantic_error.astype(float)
                 semantic_error = np.mean(semantic_error) * 100.0
                 
+                #序列标注问题求F1
                 f1, precision, recall = compute_f1_score(correct_slots, slot_outputs)
+
                 logging.info("slot f1: " + str(f1))
                 logging.info("intent accuracy: " + str(accuracy))
                 logging.info("semantic error(intent, slots are all ircorrect): " + str(semantic_error))
@@ -397,7 +400,7 @@ with tf.Session() as sess:
                 return f1, accuracy, semantic_error, pred_intents, correct_intents,\
                         slot_outputs, correct_slots, input_words, gate_seq
 
-            logging.inf("Valid: ")
+            logging.info("Valid: ")
             epoch_valid_slot, epoch_valid_intent, epoch_valid_err, valid_pred_intent, valid_correct_intent, \
                     valid_pred_slot, valid_correct_slot, valid_words, valid_gate = \
                     valid(os.path.join(full_valid_path, arg.input_file), \
